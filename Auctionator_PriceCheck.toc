@@ -1,0 +1,11 @@
+## Interface: 120001, 120000, 50503, 38000, 20505, 11508
+## Title: Auctionator Price Check
+## Notes: Price check window and chat command integration for Auctionator historical scan data
+## Author: GarbageDPS
+## Version: 1.0.0
+## OptionalDeps: Auctionator
+## SavedVariables: AUCTIONATOR_PRICECHECK_NAME_CACHE
+
+Utilities.lua
+NameCache.lua
+Core.lua
