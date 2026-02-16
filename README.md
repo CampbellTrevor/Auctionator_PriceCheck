@@ -27,7 +27,15 @@ Chat commands:
 - `!pc <query>`
 - `!pricecheck <query>`
 
-Supported chat sources include say/yell/guild/party/raid/instance/channel events.
+Example (in guild chat):
+
+- Type in guild chat: `!pc Shadowcloth`
+- PriceCheck will reply in guild chat with the lookup result.
+
+Supported/expected use:
+
+- Works in `Guild` and `Party` chat.
+- Do not rely on `/say` auto-replies (protected chat restrictions can block it).
 
 ## Lookup Behavior
 
@@ -70,4 +78,3 @@ If an item has an Auctionator tooltip price but name lookup fails:
 2. Wait briefly for item info events.
 3. Retry by name.
 4. If needed, run `/pc refresh`.
-
