@@ -2,6 +2,8 @@ local ADDON_NAME, APC = ...
 APC = APC or _G.AuctionatorPriceCheckNS or {}
 _G.AuctionatorPriceCheckNS = APC
 local CALLER_ID = "Auctionator_PriceCheck"
+local ADDON_MSG_PREFIX = "APCPC1"
+local COORDINATION_WINDOW_SECONDS = 0.45
 local NativeSendChatMessage = C_ChatInfo and C_ChatInfo.SendChatMessage
 
 local Trim = APC.Trim
@@ -62,6 +64,8 @@ local PriceCheck = {
   sendBlockedTypes = {},
   pendingSends = {},
   combatBlockedNoticeShown = false,
+  coordinatedRequests = {},
+  addonPrefixReady = false,
   frame = nil,
   scrollFrame = nil,
   searchBox = nil,
@@ -208,6 +212,210 @@ end
 
 local ShowSearchMatches
 local RenderStoredResults
+local ResolveItem
+local LookupAuctionatorInfo
+local SendPublicChatMessage
+local ExecuteLookup
+local TryGetItemIDFromLink
+
+local function IsGroupCoordinatedChat(chatType)
+  return chatType == "GUILD" or chatType == "PARTY"
+end
+
+local function GetFullPlayerName()
+  if type(UnitFullName) == "function" then
+    local name, realm = UnitFullName("player")
+    if type(name) == "string" and name ~= "" then
+      if type(realm) == "string" and realm ~= "" then
+        return name .. "-" .. realm
+      end
+      return name
+    end
+  end
+  return UnitName("player") or "Unknown"
+end
+
+local function NormalizePlayerKey(name)
+  return tostring(name or ""):lower()
+end
+
+local function HashString(text)
+  local hash = 5381
+  for i = 1, #text do
+    hash = ((hash * 33) + text:byte(i)) % 2147483647
+  end
+  return hash
+end
+
+local function BuildCoordinationRequestID(query, sender, chatType, channelTarget)
+  local bucket = math.floor(((GetServerTime and GetServerTime()) or time()) / 2)
+  local seed = table.concat({
+    tostring(sender or ""),
+    NormalizeSearchText(query),
+    tostring(chatType or ""),
+    tostring(channelTarget or ""),
+    tostring(bucket),
+  }, "|")
+  return tostring(HashString(seed))
+end
+
+local function TryResolveQuickItemID(query)
+  local trimmed = Trim(query)
+  if trimmed == "" then
+    return nil
+  end
+
+  local itemID = tonumber(trimmed)
+  if itemID then
+    return itemID
+  end
+
+  local explicitLink = trimmed:match("(item:[^%s]+)")
+  if explicitLink then
+    itemID = TryGetItemIDFromLink(explicitLink)
+    if itemID then
+      return itemID
+    end
+  end
+
+  local _, itemLink = GetItemInfo(trimmed)
+  return TryGetItemIDFromLink(itemLink)
+end
+
+local function ComputeQueryStalenessMinutes(query)
+  local itemID = TryResolveQuickItemID(query)
+  if not itemID then
+    return 2147483647
+  end
+
+  if type(Auctionator) == "table" and type(Auctionator.API) == "table" and type(Auctionator.API.v1) == "table" and type(Auctionator.API.v1.GetAuctionAgeByItemID) == "function" then
+    local ageDays = Auctionator.API.v1.GetAuctionAgeByItemID(CALLER_ID, itemID)
+    if type(ageDays) == "number" then
+      return math.max(0, ageDays * 1440)
+    end
+  end
+
+  local lastSeenTs = LastSeenTimestampForKey(tostring(itemID))
+  if type(lastSeenTs) == "number" then
+    return math.max(0, math.floor((time() - lastSeenTs) / 60))
+  end
+
+  return 2147483647
+end
+
+local function IsCandidateBetter(candidate, best)
+  if not best then
+    return true
+  end
+
+  if candidate.staleMinutes ~= best.staleMinutes then
+    return candidate.staleMinutes < best.staleMinutes
+  end
+
+  return candidate.senderKey < best.senderKey
+end
+
+local function ParseCoordinationBid(message)
+  if type(message) ~= "string" then
+    return nil
+  end
+
+  local requestID, chatType, channelToken, staleText = message:match("^BID\t([^\t]+)\t([^\t]+)\t([^\t]*)\t([^\t]+)$")
+  if not requestID then
+    return nil
+  end
+
+  local staleMinutes = tonumber(staleText)
+  if type(staleMinutes) ~= "number" then
+    return nil
+  end
+
+  return requestID, chatType, channelToken, staleMinutes
+end
+
+local function BroadcastCoordinationBid(requestID, chatType, channelTarget, staleMinutes)
+  if not (C_ChatInfo and type(C_ChatInfo.SendAddonMessage) == "function" and PriceCheck.addonPrefixReady) then
+    return
+  end
+
+  local payload = string.format("BID\t%s\t%s\t%s\t%d", requestID, tostring(chatType or ""), tostring(channelTarget or ""), staleMinutes)
+  local ok = pcall(C_ChatInfo.SendAddonMessage, ADDON_MSG_PREFIX, payload, chatType, channelTarget)
+  DebugLog("COORD", "broadcast bid", { ok = ok, requestID = requestID, chatType = chatType, staleMinutes = staleMinutes })
+end
+
+local function FinalizeCoordinatedLookup(requestID)
+  local request = PriceCheck.coordinatedRequests[requestID]
+  if not request then
+    return
+  end
+  PriceCheck.coordinatedRequests[requestID] = nil
+
+  if not request.bestCandidate then
+    ExecuteLookup(request.query, request.source, request.sender, function(replyText)
+      SendPublicChatMessage(replyText, request.chatType, request.channelTarget)
+    end)
+    return
+  end
+
+  if request.bestCandidate.senderKey ~= request.selfSenderKey then
+    DebugLog("COORD", "skipping reply; fresher peer won", {
+      requestID = requestID,
+      winner = request.bestCandidate.sender,
+      staleMinutes = request.bestCandidate.staleMinutes,
+    })
+    return
+  end
+
+  DebugLog("COORD", "self elected to reply", { requestID = requestID, staleMinutes = request.bestCandidate.staleMinutes })
+  ExecuteLookup(request.query, request.source, request.sender, function(replyText)
+    SendPublicChatMessage(replyText, request.chatType, request.channelTarget)
+  end)
+end
+
+local function StartCoordinatedLookup(query, source, sender, chatType, channelTarget)
+  if not IsGroupCoordinatedChat(chatType) then
+    ExecuteLookup(query, source, sender, function(replyText)
+      SendPublicChatMessage(replyText, chatType, channelTarget)
+    end)
+    return
+  end
+
+  if not (PriceCheck.addonPrefixReady and C_ChatInfo and type(C_ChatInfo.SendAddonMessage) == "function" and type(C_Timer) == "table" and type(C_Timer.After) == "function") then
+    DebugLog("COORD", "coordination unavailable; fallback immediate", { chatType = chatType })
+    ExecuteLookup(query, source, sender, function(replyText)
+      SendPublicChatMessage(replyText, chatType, channelTarget)
+    end)
+    return
+  end
+
+  local requestID = BuildCoordinationRequestID(query, sender, chatType, channelTarget)
+  if PriceCheck.coordinatedRequests[requestID] then
+    return
+  end
+
+  local selfSender = GetFullPlayerName()
+  local selfCandidate = {
+    sender = selfSender,
+    senderKey = NormalizePlayerKey(selfSender),
+    staleMinutes = ComputeQueryStalenessMinutes(query),
+  }
+
+  PriceCheck.coordinatedRequests[requestID] = {
+    requestID = requestID,
+    query = query,
+    source = source,
+    sender = sender,
+    chatType = chatType,
+    channelTarget = channelTarget,
+    selfSenderKey = selfCandidate.senderKey,
+    bestCandidate = selfCandidate,
+  }
+
+  BroadcastCoordinationBid(requestID, chatType, channelTarget, selfCandidate.staleMinutes)
+  C_Timer.After(COORDINATION_WINDOW_SECONDS, function()
+    FinalizeCoordinatedLookup(requestID)
+  end)
+end
 
 local function InvalidateLookupCaches(reason)
   PriceCheck.itemCatalogBuilt = false
@@ -573,6 +781,50 @@ local function BuildItemCatalog()
   })
 end
 
+local function IsAuctionatorPriceDatabaseReady()
+  if type(AUCTIONATOR_PRICE_DATABASE) ~= "table" then
+    return false
+  end
+
+  for realmKey in pairs(AUCTIONATOR_PRICE_DATABASE) do
+    if realmKey ~= "__dbversion" then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function PrewarmCatalogAtLoad()
+  if PriceCheck.itemCatalogBuilt then
+    return
+  end
+
+  local attempts = 0
+  local maxAttempts = 20
+
+  local function attemptBuild()
+    if PriceCheck.itemCatalogBuilt then
+      return
+    end
+
+    attempts = attempts + 1
+    if IsAuctionatorPriceDatabaseReady() or attempts >= maxAttempts then
+      DebugLog("CATALOG", "prewarm attempt", { attempts = attempts, dbReady = IsAuctionatorPriceDatabaseReady() })
+      BuildItemCatalog()
+      return
+    end
+
+    if type(C_Timer) == "table" and type(C_Timer.After) == "function" then
+      C_Timer.After(0.25, attemptBuild)
+    else
+      BuildItemCatalog()
+    end
+  end
+
+  attemptBuild()
+end
+
 local FindCatalogMatchesByName
 
 local function FindExactCatalogMatchesByName(query, limit)
@@ -658,7 +910,7 @@ FindCatalogMatchesByName = function(query, limit)
   return results
 end
 
-local function TryGetItemIDFromLink(itemLink)
+TryGetItemIDFromLink = function(itemLink)
   if not itemLink then
     return nil
   end
@@ -670,7 +922,7 @@ local function TryGetItemIDFromLink(itemLink)
   return itemID
 end
 
-local function ResolveItem(query)
+ResolveItem = function(query)
   query = Trim(query)
   DebugLog("RESOLVE", "start", { query = query })
   if query == "" then
@@ -777,7 +1029,7 @@ local function ResolveItem(query)
   return nil, "item not found in local item cache (try exact name, item link, or itemID)"
 end
 
-local function LookupAuctionatorInfo(item)
+LookupAuctionatorInfo = function(item)
   local current = nil
   if type(Auctionator) == "table" and type(Auctionator.API) == "table" and type(Auctionator.API.v1) == "table" then
     local price = Auctionator.API.v1.GetAuctionPriceByItemID(CALLER_ID, item.itemID)
@@ -994,7 +1246,7 @@ local function TryNativeSend(safeText, chatType, channelTarget)
   return ok
 end
 
-local function SendPublicChatMessage(text, chatType, channelTarget)
+SendPublicChatMessage = function(text, chatType, channelTarget)
   local safeText = SanitizeForSendChatMessage(text)
   if safeText == "" then
     DebugLog("SEND", "blocked empty message", { chatType = chatType })
@@ -1081,7 +1333,7 @@ local function FlushPendingSends()
   end
 end
 
-local function ExecuteLookup(query, source, sender, publicResponder)
+ExecuteLookup = function(query, source, sender, publicResponder)
   DebugLog("LOOKUP", "start", { query = query, source = source, sender = sender })
   if query == nil or Trim(query) == "" then
     local errText = "missing item name"
@@ -1096,7 +1348,7 @@ local function ExecuteLookup(query, source, sender, publicResponder)
   local isNumericQuery = tonumber(trimmedQuery) ~= nil
   local isLinkQuery = type(query) == "string" and query:find("item:[^%s]+") ~= nil
 
-  if not isNumericQuery and not isLinkQuery then
+  if not isNumericQuery and not isLinkQuery and PriceCheck.itemCatalogBuilt then
     local multiMatches = FindCatalogMatchesByName(trimmedQuery, 3)
     if #multiMatches > 1 then
       DebugLog("LOOKUP", "multiple name matches for plain-text query", { query = trimmedQuery, count = #multiMatches })
@@ -1348,7 +1600,7 @@ local function GetChatReplyTarget(event, channelNumber, channelName)
 end
 
 eventFrame:SetScript("OnEvent", function(_, event, ...)
-  if event == "ADDON_LOADED" or event == "PLAYER_REGEN_ENABLED" or event == "GET_ITEM_INFO_RECEIVED" then
+  if event == "ADDON_LOADED" or event == "PLAYER_REGEN_ENABLED" or event == "GET_ITEM_INFO_RECEIVED" or event == "CHAT_MSG_ADDON" then
     DebugLog("EVENT", "received", { event = event })
   end
   if event == "ADDON_LOADED" then
@@ -1372,6 +1624,12 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     end
     eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
     eventFrame:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+    eventFrame:RegisterEvent("CHAT_MSG_ADDON")
+
+    if C_ChatInfo and type(C_ChatInfo.RegisterAddonMessagePrefix) == "function" then
+      PriceCheck.addonPrefixReady = C_ChatInfo.RegisterAddonMessagePrefix(ADDON_MSG_PREFIX) and true or false
+      DebugLog("COORD", "addon prefix register", { prefix = ADDON_MSG_PREFIX, success = PriceCheck.addonPrefixReady })
+    end
 
     local canAutoSend, reason = HasSafeAutoSendPath()
     if not canAutoSend then
@@ -1385,6 +1643,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99PriceCheck|r loaded. Use /pc or !pc <item> in chat.")
     DebugLog("INIT", "addon loaded")
     EnsureAuctionatorScanHooks()
+    PrewarmCatalogAtLoad()
     eventFrame:UnregisterEvent("ADDON_LOADED")
     return
   end
@@ -1412,6 +1671,51 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     return
   end
 
+  if event == "CHAT_MSG_ADDON" then
+    local prefix, payload, channel, remoteSender = ...
+    if prefix ~= ADDON_MSG_PREFIX then
+      return
+    end
+
+    local requestID, bidChatType, bidChannelToken, staleMinutes = ParseCoordinationBid(payload)
+    if not requestID then
+      return
+    end
+
+    local request = PriceCheck.coordinatedRequests[requestID]
+    if not request then
+      return
+    end
+
+    if request.chatType ~= bidChatType then
+      return
+    end
+
+    if tostring(request.channelTarget or "") ~= tostring(bidChannelToken or "") then
+      return
+    end
+
+    if request.chatType ~= channel then
+      return
+    end
+
+    local candidate = {
+      sender = remoteSender or "Unknown",
+      senderKey = NormalizePlayerKey(remoteSender),
+      staleMinutes = staleMinutes,
+    }
+
+    if IsCandidateBetter(candidate, request.bestCandidate) then
+      request.bestCandidate = candidate
+      DebugLog("COORD", "updated winner candidate", {
+        requestID = requestID,
+        sender = candidate.sender,
+        staleMinutes = candidate.staleMinutes,
+      })
+    end
+    return
+  end
+
   local message, sender, _, channelName, _, _, _, _, channelNumber = ...
   local query = ParseChatCommand(message)
   if not query then
@@ -1420,11 +1724,11 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
 
   DebugLog("CHAT", "chat command dispatch", { event = event, sender = SenderName(sender), query = query, channel = channelName, channelNumber = channelNumber })
   local chatType, channelTarget = GetChatReplyTarget(event, channelNumber, channelName)
-  ExecuteLookup(query, event, SenderName(sender), function(replyText)
-    if chatType then
-      SendPublicChatMessage(replyText, chatType, channelTarget)
-    end
-  end)
+  if chatType then
+    StartCoordinatedLookup(query, event, SenderName(sender), chatType, channelTarget)
+  else
+    ExecuteLookup(query, event, SenderName(sender))
+  end
 end)
 
 eventFrame:RegisterEvent("ADDON_LOADED")
