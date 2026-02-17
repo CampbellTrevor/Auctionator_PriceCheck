@@ -22,3 +22,5 @@ jobs:
 
       - name: Package and publish
         uses: BigWigsMods/packager@v2
+        with:
+          args: -g bcc
