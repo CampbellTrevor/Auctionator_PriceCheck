@@ -190,6 +190,22 @@ local function ComputeAgeDaysFromTimestamp(timestamp)
   return math.floor((time() - timestamp) / 86400)
 end
 
+local function FormatAgeAgo(lastSeenTs, ageDays)
+  if type(lastSeenTs) == "number" then
+    local elapsed = math.max(0, time() - lastSeenTs)
+    local days = math.floor(elapsed / 86400)
+    local hours = math.floor((elapsed % 86400) / 3600)
+    local minutes = math.floor((elapsed % 3600) / 60)
+    return string.format("%dd %dh %dm ago", days, hours, minutes)
+  end
+
+  if type(ageDays) == "number" then
+    return string.format("%dd 0h 0m ago", ageDays)
+  end
+
+  return "unknown age"
+end
+
 local ShowSearchMatches
 local RenderStoredResults
 
@@ -816,9 +832,7 @@ local function BuildResultLine(source, sender, item, info, err)
   end
 
   local ageText = "unknown age"
-  if type(info.ageDays) == "number" then
-    ageText = string.format("%dd ago", info.ageDays)
-  end
+  ageText = FormatAgeAgo(info.lastSeenTs, info.ageDays)
 
   return string.format("[%s] %s%s: %s (last scan %s, %s)", prefix, from, label, priceText, scanText, ageText)
 end
@@ -884,7 +898,7 @@ ShowSearchMatches = function(query)
 
   for _, item in ipairs(matches) do
     local scanText = item.lastSeenTs and date("%Y-%m-%d", item.lastSeenTs) or "unknown"
-    local ageText = type(item.ageDays) == "number" and string.format("%dd ago", item.ageDays) or "unknown age"
+    local ageText = FormatAgeAgo(item.lastSeenTs, item.ageDays)
     local label = DisplayLabelForItem(item)
     local line = string.format("%s: %s (last scan %s, %s)", label, FormatPrice(item.price), scanText, ageText)
     PriceCheck.scrollFrame:AddMessage(line)
@@ -913,7 +927,7 @@ local function HandleMultiNameMatches(query, source, sender, publicResponder)
 
   for _, item in ipairs(matches) do
     local scanText = item.lastSeenTs and date("%Y-%m-%d", item.lastSeenTs) or "unknown"
-    local ageText = type(item.ageDays) == "number" and string.format("%dd ago", item.ageDays) or "unknown age"
+    local ageText = FormatAgeAgo(item.lastSeenTs, item.ageDays)
     local itemLabel = DisplayLabelForItem(item)
     local info = {
       price = item.price,
@@ -936,7 +950,7 @@ local function BuildPublicChatLine(item, info, errText, queryText)
   end
 
   local scanText = info.lastSeenTs and date("%Y-%m-%d", info.lastSeenTs) or "unknown"
-  local ageText = type(info.ageDays) == "number" and string.format("%dd ago", info.ageDays) or "unknown age"
+  local ageText = FormatAgeAgo(info.lastSeenTs, info.ageDays)
   return string.format("PriceCheck %s: %s (last scan %s, %s)", label, FormatPricePlain(info.price), scanText, ageText)
 end
 
