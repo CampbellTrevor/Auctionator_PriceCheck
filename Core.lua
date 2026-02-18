@@ -87,6 +87,12 @@ local function DebugLog(tag, text, fields)
   -- Intentionally left as a no-op in release builds.
 end
 
+local function AddonMessage(text)
+  if DEFAULT_CHAT_FRAME and type(DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+    DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99PriceCheck|r [Coord] " .. tostring(text or ""))
+  end
+end
+
 local function DecodeCBORString(raw)
   if type(raw) ~= "string" then
     return nil
@@ -194,6 +200,33 @@ local function ComputeAgeDaysFromTimestamp(timestamp)
   return math.floor((time() - timestamp) / 86400)
 end
 
+local function GetRecordedPlayerScanTimestamp()
+  if type(AUCTIONATOR_PRICECHECK_SCAN_STATE) ~= "table" then
+    return nil
+  end
+
+  local ts = AUCTIONATOR_PRICECHECK_SCAN_STATE.lastPlayerScanTs
+  if type(ts) == "number" then
+    return ts
+  end
+
+  return nil
+end
+
+local function GetDisplayScanTimestamp(candidateTs)
+  return GetRecordedPlayerScanTimestamp() or candidateTs
+end
+
+local function RecordPlayerScanTimestamp(eventName)
+  if type(AUCTIONATOR_PRICECHECK_SCAN_STATE) ~= "table" then
+    AUCTIONATOR_PRICECHECK_SCAN_STATE = {}
+  end
+
+  local ts = time()
+  AUCTIONATOR_PRICECHECK_SCAN_STATE.lastPlayerScanTs = ts
+  AUCTIONATOR_PRICECHECK_SCAN_STATE.lastPlayerScanEvent = tostring(eventName or "")
+end
+
 local function FormatAgeAgo(lastSeenTs, ageDays)
   if type(lastSeenTs) == "number" then
     local elapsed = math.max(0, time() - lastSeenTs)
@@ -283,6 +316,11 @@ local function TryResolveQuickItemID(query)
 end
 
 local function ComputeQueryStalenessMinutes(query)
+  local scanTs = GetRecordedPlayerScanTimestamp()
+  if type(scanTs) == "number" then
+    return math.max(0, math.floor((time() - scanTs) / 60))
+  end
+
   local itemID = TryResolveQuickItemID(query)
   if not itemID then
     return 2147483647
@@ -351,11 +389,19 @@ local function FinalizeCoordinatedLookup(requestID)
   PriceCheck.coordinatedRequests[requestID] = nil
 
   if not request.bestCandidate then
+    AddonMessage(string.format("No bids received for \"%s\"; replying locally.", request.query))
     ExecuteLookup(request.query, request.source, request.sender, function(replyText)
       SendPublicChatMessage(replyText, request.chatType, request.channelTarget)
     end)
     return
   end
+
+  AddonMessage(string.format(
+    "Winner for \"%s\": %s (%dm)",
+    request.query,
+    request.bestCandidate.sender or "Unknown",
+    request.bestCandidate.staleMinutes or -1
+  ))
 
   if request.bestCandidate.senderKey ~= request.selfSenderKey then
     DebugLog("COORD", "skipping reply; fresher peer won", {
@@ -399,6 +445,7 @@ local function StartCoordinatedLookup(query, source, sender, chatType, channelTa
     senderKey = NormalizePlayerKey(selfSender),
     staleMinutes = ComputeQueryStalenessMinutes(query),
   }
+  AddonMessage(string.format("Bid for \"%s\": %s (%dm)", query, selfSender, selfCandidate.staleMinutes))
 
   PriceCheck.coordinatedRequests[requestID] = {
     requestID = requestID,
@@ -466,6 +513,7 @@ local function TryRegisterAuctionatorScanHooks()
 
   local listener = {
     ReceiveEvent = function(_, eventName)
+      RecordPlayerScanTimestamp(eventName)
       DebugLog("EVENT", "auctionator scan event", { event = eventName })
       InvalidateLookupCaches("scan_event:" .. tostring(eventName))
     end
@@ -1078,13 +1126,14 @@ local function BuildResultLine(source, sender, item, info, err)
 
   local label = DisplayLabelForItem(item)
   local priceText = FormatPrice(info.price)
+  local displayScanTs = GetDisplayScanTimestamp(info.lastSeenTs)
   local scanText = "unknown"
-  if info.lastSeenTs then
-    scanText = date("%Y-%m-%d", info.lastSeenTs)
+  if displayScanTs then
+    scanText = date("%Y-%m-%d", displayScanTs)
   end
 
   local ageText = "unknown age"
-  ageText = FormatAgeAgo(info.lastSeenTs, info.ageDays)
+  ageText = FormatAgeAgo(displayScanTs, info.ageDays)
 
   return string.format("[%s] %s%s: %s (last scan %s, %s)", prefix, from, label, priceText, scanText, ageText)
 end
@@ -1149,8 +1198,9 @@ ShowSearchMatches = function(query)
   end
 
   for _, item in ipairs(matches) do
-    local scanText = item.lastSeenTs and date("%Y-%m-%d", item.lastSeenTs) or "unknown"
-    local ageText = FormatAgeAgo(item.lastSeenTs, item.ageDays)
+    local displayScanTs = GetDisplayScanTimestamp(item.lastSeenTs)
+    local scanText = displayScanTs and date("%Y-%m-%d", displayScanTs) or "unknown"
+    local ageText = FormatAgeAgo(displayScanTs, item.ageDays)
     local label = DisplayLabelForItem(item)
     local line = string.format("%s: %s (last scan %s, %s)", label, FormatPrice(item.price), scanText, ageText)
     PriceCheck.scrollFrame:AddMessage(line)
@@ -1178,8 +1228,9 @@ local function HandleMultiNameMatches(query, source, sender, publicResponder)
   end
 
   for _, item in ipairs(matches) do
-    local scanText = item.lastSeenTs and date("%Y-%m-%d", item.lastSeenTs) or "unknown"
-    local ageText = FormatAgeAgo(item.lastSeenTs, item.ageDays)
+    local displayScanTs = GetDisplayScanTimestamp(item.lastSeenTs)
+    local scanText = displayScanTs and date("%Y-%m-%d", displayScanTs) or "unknown"
+    local ageText = FormatAgeAgo(displayScanTs, item.ageDays)
     local itemLabel = DisplayLabelForItem(item)
     local info = {
       price = item.price,
@@ -1201,8 +1252,9 @@ local function BuildPublicChatLine(item, info, errText, queryText)
     return string.format("PriceCheck %s: %s", label, errText)
   end
 
-  local scanText = info.lastSeenTs and date("%Y-%m-%d", info.lastSeenTs) or "unknown"
-  local ageText = FormatAgeAgo(info.lastSeenTs, info.ageDays)
+  local displayScanTs = GetDisplayScanTimestamp(info.lastSeenTs)
+  local scanText = displayScanTs and date("%Y-%m-%d", displayScanTs) or "unknown"
+  local ageText = FormatAgeAgo(displayScanTs, info.ageDays)
   return string.format("PriceCheck %s: %s (last scan %s, %s)", label, FormatPricePlain(info.price), scanText, ageText)
 end
 
@@ -1612,6 +1664,12 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     if type(AUCTIONATOR_PRICECHECK_NAME_CACHE) ~= "table" then
       AUCTIONATOR_PRICECHECK_NAME_CACHE = {}
     end
+    if type(AUCTIONATOR_PRICECHECK_SCAN_STATE) ~= "table" then
+      AUCTIONATOR_PRICECHECK_SCAN_STATE = {}
+    end
+    if type(AUCTIONATOR_PRICECHECK_SCAN_STATE.lastPlayerScanTs) ~= "number" then
+      AUCTIONATOR_PRICECHECK_SCAN_STATE.lastPlayerScanTs = nil
+    end
 
     CreateWindow()
 
@@ -1704,6 +1762,8 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
       senderKey = NormalizePlayerKey(remoteSender),
       staleMinutes = staleMinutes,
     }
+
+    AddonMessage(string.format("Bid for \"%s\": %s (%dm)", request.query, candidate.sender, candidate.staleMinutes))
 
     if IsCandidateBetter(candidate, request.bestCandidate) then
       request.bestCandidate = candidate

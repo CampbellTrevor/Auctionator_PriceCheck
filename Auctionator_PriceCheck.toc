@@ -5,7 +5,7 @@
 ## Version: 1.0.0
 ## X-Curse-Project-ID: 1464342
 ## OptionalDeps: Auctionator
-## SavedVariables: AUCTIONATOR_PRICECHECK_NAME_CACHE
+## SavedVariables: AUCTIONATOR_PRICECHECK_NAME_CACHE, AUCTIONATOR_PRICECHECK_SCAN_STATE
 
 Utilities.lua
 NameCache.lua
