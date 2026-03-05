@@ -13,6 +13,11 @@ It reads local Auctionator data only. No external service calls.
 - World of Warcraft
 - Auctionator installed and collecting scan data
 
+Supported flavors:
+
+- Retail (Mainline)
+- Burning Crusade Classic (TBC)
+
 ## Commands
 
 - `/pc`
